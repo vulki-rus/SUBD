@@ -1,1 +1,1 @@
-[# SUBD](https://github.com/vulki-rus/SUBD)
+https://github.com/vulki-rus/SUBD
