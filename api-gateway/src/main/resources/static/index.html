@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>СУБД Интерфейс</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <style>
+        body {
+            padding-top: 20px;
+        }
+        .table-wrap {
+            max-height: 520px;
+            overflow: auto;
+        }
+        .data-table {
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body class="bg-light">
+<div class="container-fluid">
+    <div class="row mb-3">
+        <div class="col-12 d-flex justify-content-between align-items-center">
+            <h3>СУБД Интерфейс</h3>
+            <div>
+                <span id="userRoleLabel" class="me-3"></span>
+                <button class="btn btn-outline-secondary btn-sm" onclick="logout()">Выйти</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="row mb-3">
+        <div class="col-md-4">
+            <select id="menuSelect" class="form-select" onchange="onMenuChange(this)">
+                <!-- наполняется в initMenu() -->
+            </select>
+        </div>
+    </div>
+
+    <div id="contentArea"></div>
+</div>
+
+<script>
+    const COREBASEURL = "http://localhost:8081/api";
+
+    const adminTables = [
+        "clients","brands","models","cars","employees",
+        "sales","manufacturers","spare_parts","services",
+        "appointments","service_spare_parts","cars_log"
+    ];
+
+    const userForbiddenTables = ["employees","cars_log"];
+
+    const allViews = [
+        "view_clients_info",
+        "view_cars_info",
+        "view_sales_summary",
+        "view_1",
+        "view_2",
+        "view_3",
+        "sales_lab5"
+    ];
+
+    const editableViews = ["view_1"]; // updatable view
+
+    let currentUser = null;
+    let currentTableName = null;
+    let currentTableData = [];
+    let deletedIds = [];
+    let relationBaseTable = null;
+
+    const oneToManyRelations = [
+        {base: "brands", childTable: "models", childFk: "brand_id", basePk: "id" },
+        {base: "models", childTable: "cars", childFk: "model_id", basePk: "id" },
+        {base: "sales", childTable: "appointments", childFk: "sale_id", basePk: "id" },
+        {base: "sales", childTable: "service_spare_parts", childFk: "sale_id", basePk: "id" }
+    ];
+
+    async function initApp() {
+        try {
+            const resp = await axios.get("/api/me");
+            const data = resp.data;
+            const roles = data.roles.map(r => r.authority);
+            currentUser = {
+                username: data.username,
+                role: roles.includes("ROLE_ADMIN") ? "ADMIN" : "USER"
+            };
+            document.getElementById("userRoleLabel").innerText =
+                currentUser.username + " (" + currentUser.role + ")";
+            initMenu();
+        } catch (e) {
+            console.error("/api/me", e);
+        }
+    }
+
+    function initMenu() {
+        const menu = document.getElementById("menuSelect");
+        menu.innerHTML = "";
+
+        const isAdmin = currentUser && currentUser.role === "ADMIN";
+
+        const options = isAdmin
+            ? ["1. Таблицы"]
+            : ["1. Таблицы", "2. Представления", "3. Связи один-ко-многим", "4. Отчёты"];
+
+        options.forEach(o => {
+            const opt = document.createElement("option");
+            opt.value = o;
+            opt.textContent = o;
+            menu.appendChild(opt);
+        });
+
+        menu.selectedIndex = 0;
+        onMenuChange();
+    }
+
+    function onMenuChange() {
+        const val = document.getElementById("menuSelect").value;
+        if (val.startsWith("1.")) {
+            showTablesView();
+        } else if (val.startsWith("2.")) {
+            showViewsView();
+        } else if (val.startsWith("3.")) {
+            showRelationsView();
+        } else if (val.startsWith("4.")) {
+            showReportsView();
+        }
+    }
+
+    /* Таблицы */
+
+    function showTablesView() {
+        const isAdmin = currentUser && currentUser.role === "ADMIN";
+        const content = document.getElementById("contentArea");
+
+        const baseTables = isAdmin
+            ? adminTables.slice()
+            : adminTables.filter(t => !userForbiddenTables.includes(t));
+
+        const defaultTable = isAdmin ? "clients" : "sales";
+        currentTableName = defaultTable;
+        deletedIds = [];
+
+        content.innerHTML = `
+            <div class="row mb-2">
+                <div class="col-md-3 d-flex align-items-center">
+                    <h5 id="currentTableLabel" class="mb-0">${defaultTable}</h5>
+                </div>
+                <div class="col-md-3">
+                    <select id="tableSelect" class="form-select"></select>
+                </div>
+                <div class="col-md-2">
+                    <button id="saveBtn" class="btn btn-success w-100">Сохранить</button>
+                </div>
+                <div class="col-md-2">
+                    <button id="addRowBtn" class="btn btn-primary w-100">Добавить</button>
+                </div>
+                <div class="col-md-2">
+                    <button id="deleteBtn" class="btn btn-danger w-100">Удалить</button>
+                </div>
+            </div>
+            <div class="row">
+                <div class="col-12 table-wrap border bg-white">
+                    <div id="tableContainer" class="p-2"></div>
+                </div>
+            </div>
+        `;
+
+        const sel = document.getElementById("tableSelect");
+        baseTables.forEach(t => {
+            const o = document.createElement("option");
+            o.value = t;
+            o.textContent = t;
+            sel.appendChild(o);
+        });
+        sel.value = defaultTable;
+        sel.addEventListener("change", () => {
+            deletedIds = [];
+            loadTable(sel.value);
+        });
+
+        document.getElementById("addRowBtn").onclick = addRow;
+        document.getElementById("deleteBtn").onclick = deleteSelectedRow;
+        document.getElementById("saveBtn").onclick = saveCurrentTable;
+
+        loadTable(defaultTable);
+    }
+
+    async function loadTable(tableName) {
+        const container = document.getElementById("tableContainer");
+        currentTableName = tableName;
+        document.getElementById("currentTableLabel").innerText = tableName;
+        container.innerHTML = "<div class='p-3 text-muted'>Загрузка...</div>";
+        deletedIds = [];
+        try {
+            const resp = await axios.get(`${COREBASEURL}/tables/${tableName}`);
+            renderTableInto(container, resp.data);
+        } catch (e) {
+            container.innerHTML = `<div class="alert alert-danger">Ошибка загрузки</div>`;
+        }
+    }
+
+    function renderTableInto(container, data) {
+        currentTableData = data;
+        if (!currentTableData.length) {
+            container.innerHTML = "<div class='p-3 text-muted'>Нет данных</div>";
+            return;
+        }
+        const headers = Object.keys(currentTableData[0]);
+        const visibleHeaders = headers.filter(h => h !== "id");
+
+        let html = `
+            <table id="mainTable" class="table table-sm table-striped table-hover data-table">
+                <thead class="table-dark">
+                    <tr>
+        `;
+        visibleHeaders.forEach(h => {
+            html += `<th>${h}</th>`;
+        });
+        html += `
+                    </tr>
+                </thead>
+                <tbody class="bg-light" id="filterBody">
+                    <tr>
+        `;
+        visibleHeaders.forEach(h => {
+            html += `<td><input type="text" class="form-control form-control-sm column-filter" data-col="${h}"></td>`;
+        });
+        html += `
+                    </tr>
+                </tbody>
+                <tbody id="dataBody">
+        `;
+
+        currentTableData.forEach((row, rowIndex) => {
+            html += `<tr data-row="${rowIndex}">`;
+            visibleHeaders.forEach(col => {
+                const val = row[col] ?? "";
+                html += `<td data-col="${col}" contenteditable="true">${val}</td>`;
+            });
+            html += `</tr>`;
+        });
+        html += `</tbody></table>`;
+        container.innerHTML = html;
+
+        const table = container.querySelector("#mainTable");
+        const dataBody = document.getElementById("dataBody");
+
+        dataBody.querySelectorAll("tr[data-row]").forEach(tr => {
+            tr.addEventListener("click", () => {
+                dataBody.querySelectorAll("tr[data-row]").forEach(r => r.classList.remove("table-primary"));
+                tr.classList.add("table-primary");
+            });
+        });
+
+        const filters = table.querySelectorAll(".column-filter");
+        filters.forEach(input => {
+            input.addEventListener("input", () => {
+                applyColumnFilters(table, visibleHeaders);
+            });
+        });
+    }
+
+    function applyColumnFilters(table, headers) {
+        const filters = { };
+        table.querySelectorAll(".column-filter").forEach(inp => {
+            const col = inp.getAttribute("data-col");
+            if (col) {
+                filters[col] = inp.value.toLowerCase();
+            }
+        });
+
+        const dataBody = document.getElementById("dataBody");
+        const rows = dataBody.querySelectorAll("tr[data-row]");
+        rows.forEach(tr => {
+            let visible = true;
+            headers.forEach(col => {
+                const filterVal = filters[col];
+                if (filterVal) {
+                    const td = tr.querySelector(`td[data-col="${col}"]`);
+                    const cellText = (td?.innerText || "").toLowerCase();
+                    if (!cellText.includes(filterVal)) {
+                        visible = false;
+                    }
+                }
+            });
+            tr.style.display = visible ? "" : "none";
+        });
+    }
+
+    function addRow() {
+        if (!currentTableName || !currentTableData.length) return;
+        const headers = Object.keys(currentTableData[0]);
+        const newRow = { };
+        headers.forEach(h => {
+            newRow[h] = h === "id" ? null : "";
+        });
+        currentTableData.push(newRow);
+        const container = document.getElementById("tableContainer");
+        renderTableInto(container, currentTableData);
+    }
+
+    async function saveCurrentTable() {
+        if (!currentTableName) return;
+        const table = document.getElementById("mainTable");
+        if (!table) return;
+
+        try {
+            for (const id of deletedIds) {
+                await axios.delete(`${COREBASEURL}/tables/${currentTableName}/${id}`);
+            }
+            deletedIds = [];
+
+            const dataBody = document.getElementById("dataBody");
+            const rows = dataBody.querySelectorAll("tr[data-row]");
+            for (const tr of rows) {
+                const rowIndex = parseInt(tr.getAttribute("data-row"), 10);
+                const rowData = {...currentTableData[rowIndex]};
+                tr.querySelectorAll("td").forEach(td => {
+                    const col = td.getAttribute("data-col");
+                    if (col) {
+                        rowData[col] = td.innerText;
+                    }
+                });
+                await axios.post(`${COREBASEURL}/tables/${currentTableName}`, rowData);
+            }
+            alert("Сохранено");
+            loadTable(currentTableName);
+        } catch (e) {
+            alert("Ошибка сохранения");
+        }
+    }
+
+    function deleteSelectedRow() {
+        const table = document.getElementById("mainTable");
+        if (!table) return;
+        const dataBody = document.getElementById("dataBody");
+        const selected = dataBody.querySelector("tr.table-primary");
+        if (!selected) {
+            alert("Выберите строку");
+            return;
+        }
+        const rowIndex = parseInt(selected.getAttribute("data-row"), 10);
+        const row = currentTableData[rowIndex];
+        if (row && row.id != null) {
+            deletedIds.push(row.id);
+        }
+        currentTableData.splice(rowIndex, 1);
+        const container = document.getElementById("tableContainer");
+        renderTableInto(container, currentTableData);
+    }
+
+    /* Представления */
+
+    function showViewsView() {
+        const content = document.getElementById("contentArea");
+        const defaultView = allViews[0];
+
+        content.innerHTML = `
+            <div class="row mb-2">
+                <div class="col-md-3 d-flex align-items-center">
+                    <h5 id="currentViewLabel" class="mb-0">${defaultView}</h5>
+                </div>
+                <div class="col-md-3">
+                    <select id="viewSelect" class="form-select"></select>
+                </div>
+                <div class="col-md-2">
+                    <button id="viewSaveBtn" class="btn btn-success w-100">Сохранить</button>
+                </div>
+                <div class="col-md-2">
+                    <button id="viewAddRowBtn" class="btn btn-primary w-100">Добавить</button>
+                </div>
+                <div class="col-md-2">
+                    <button id="viewDeleteBtn" class="btn btn-danger w-100">Удалить</button>
+                </div>
+            </div>
+            <div class="row">
+                <div class="col-12 table-wrap border bg-white">
+                    <div id="viewTableContainer" class="p-2"></div>
+                </div>
+            </div>
+        `;
+
+        const sel = document.getElementById("viewSelect");
+        allViews.forEach(v => {
+            const o = document.createElement("option");
+            o.value = v;
+            o.textContent = v;
+            sel.appendChild(o);
+        });
+        sel.value = defaultView;
+        sel.addEventListener("change", () => {
+            loadView(sel.value);
+            toggleViewButtons(sel.value);
+        });
+
+        document.getElementById("viewAddRowBtn").onclick = addRowForView;
+        document.getElementById("viewDeleteBtn").onclick = deleteSelectedRowForView;
+        document.getElementById("viewSaveBtn").onclick = saveCurrentView;
+
+        loadView(defaultView);
+        toggleViewButtons(defaultView);
+    }
+
+    function toggleViewButtons(viewName) {
+        const editable = editableViews.includes(viewName);
+        document.getElementById("viewSaveBtn").disabled = !editable;
+        document.getElementById("viewAddRowBtn").disabled = !editable;
+        document.getElementById("viewDeleteBtn").disabled = !editable;
+    }
+
+    async function loadView(viewName) {
+        const container = document.getElementById("viewTableContainer");
+        document.getElementById("currentViewLabel").innerText = viewName;
+        container.innerHTML = "<div class='p-3 text-muted'>Загрузка...</div>";
+        currentTableName = viewName;
+        deletedIds = [];
+        try {
+            const resp = await axios.get(`${COREBASEURL}/tables/${viewName}`);
+            renderTableInto(container, resp.data);
+        } catch (e) {
+            container.innerHTML = `<div class="alert alert-danger">Ошибка загрузки</div>`;
+        }
+    }
+
+    function addRowForView() {
+        if (!editableViews.includes(currentTableName)) return;
+        if (!currentTableName || !currentTableData.length) return;
+        const headers = Object.keys(currentTableData[0]);
+        const newRow = { };
+        headers.forEach(h => {
+            newRow[h] = h === "id" ? null : "";
+        });
+        currentTableData.push(newRow);
+        const container = document.getElementById("viewTableContainer");
+        renderTableInto(container, currentTableData);
+    }
+
+    function deleteSelectedRowForView() {
+        if (!editableViews.includes(currentTableName)) return;
+        const container = document.getElementById("viewTableContainer");
+        const table = container.querySelector("#mainTable");
+        if (!table) return;
+        const dataBody = table.querySelector("#dataBody");
+        const selected = dataBody.querySelector("tr.table-primary");
+        if (!selected) {
+            alert("Выберите строку");
+            return;
+        }
+        const rowIndex = parseInt(selected.getAttribute("data-row"), 10);
+        const row = currentTableData[rowIndex];
+        if (row && row.id != null) {
+            deletedIds.push(row.id);
+        }
+        currentTableData.splice(rowIndex, 1);
+        renderTableInto(container, currentTableData);
+    }
+
+    async function saveCurrentView() {
+        if (!editableViews.includes(currentTableName)) return;
+        const container = document.getElementById("viewTableContainer");
+        const table = container.querySelector("#mainTable");
+        if (!table) return;
+        try {
+            for (const id of deletedIds) {
+                await axios.delete(`${COREBASEURL}/tables/${currentTableName}/${id}`);
+            }
+            deletedIds = [];
+            const dataBody = table.querySelector("#dataBody");
+            const rows = dataBody.querySelectorAll("tr[data-row]");
+            for (const tr of rows) {
+                const rowIndex = parseInt(tr.getAttribute("data-row"), 10);
+                const rowData = {...currentTableData[rowIndex]};
+                tr.querySelectorAll("td").forEach(td => {
+                    const col = td.getAttribute("data-col");
+                    if (col) {
+                        rowData[col] = td.innerText;
+                    }
+                });
+                await axios.post(`${COREBASEURL}/tables/${currentTableName}`, rowData);
+            }
+            alert("Сохранено");
+            loadView(currentTableName);
+        } catch (e) {
+            alert("Ошибка сохранения");
+        }
+    }
+
+    /* Один‑ко‑многим */
+
+    function showRelationsView() {
+        const content = document.getElementById("contentArea");
+        content.innerHTML = `
+            <div class="row mb-3">
+                <div class="col-md-4">
+                    <label class="form-label">Базовая таблица</label>
+                    <select id="relBaseTableSelect" class="form-select"></select>
+                </div>
+            </div>
+            <div class="row g-2">
+                <div class="col-md-6">
+                    <h6 id="parentsTitle"></h6>
+                    <div class="table-wrap border bg-white">
+                        <div id="parentsContainer" class="p-2"></div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <h6 id="childrenTitle"></h6>
+                    <div class="table-wrap border bg-white">
+                        <div id="childrenContainer" class="p-2"></div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        const baseSel = document.getElementById("relBaseTableSelect");
+        const bases = [...new Set(oneToManyRelations.map(r => r.base))];
+        bases.forEach(t => {
+            const o = document.createElement("option");
+            o.value = t;
+            o.textContent = t;
+            baseSel.appendChild(o);
+        });
+
+        baseSel.addEventListener("change", () => {
+            relationBaseTable = baseSel.value;
+            renderParentsForBaseTable();
+        });
+
+        if (bases.length > 0) {
+            relationBaseTable = bases[0];
+            baseSel.value = relationBaseTable;
+            renderParentsForBaseTable();
+        }
+    }
+
+    function getRelationForBase(baseTable) {
+        return oneToManyRelations.find(r => r.base === baseTable) || null;
+    }
+
+    async function renderParentsForBaseTable() {
+        const parentsC = document.getElementById("parentsContainer");
+        const childrenC = document.getElementById("childrenContainer");
+        const rel = getRelationForBase(relationBaseTable);
+
+        parentsC.innerHTML = "";
+        childrenC.innerHTML = "";
+
+        if (!rel) {
+            parentsC.innerHTML = `<div class="p-2 text-muted">Для этой таблицы связь не настроена.</div>`;
+            document.getElementById("parentsTitle").innerText = "";
+            document.getElementById("childrenTitle").innerText = "";
+            return;
+        }
+
+        document.getElementById("parentsTitle").innerText = rel.base;
+        document.getElementById("childrenTitle").innerText =
+            `${rel.childTable} по ${rel.childFk}`;
+
+        try {
+            const resp = await axios.get(`${COREBASEURL}/tables/${rel.base}`);
+            const data = resp.data;
+            if (!data.length) {
+                parentsC.innerHTML = `<div class="p-2 text-muted">Нет данных</div>`;
+                return;
+            }
+            const headers = Object.keys(data[0]);
+            const visibleHeaders = headers.filter(h => h !== "id");
+            let html = `<table class="table table-sm table-striped table-hover data-table">
+                        <thead class="table-dark"><tr>`;
+            visibleHeaders.forEach(h => html += `<th>${h}</th>`);
+            html += `</tr></thead><tbody>`;
+            data.forEach(row => {
+                html += `<tr data-id="${row[rel.basePk]}">`;
+                visibleHeaders.forEach(h => html += `<td>${row[h] ?? ""}</td>`);
+                html += `</tr>`;
+            });
+            html += `</tbody></table>`;
+            parentsC.innerHTML = html;
+
+            parentsC.querySelectorAll("tr[data-id]").forEach(tr => {
+                tr.addEventListener("click", () => {
+                    parentsC.querySelectorAll("tr[data-id]").forEach(r => r.classList.remove("table-primary"));
+                    tr.classList.add("table-primary");
+                    const id = tr.getAttribute("data-id");
+                    loadChildrenForRelation(rel, id);
+                });
+            });
+        } catch (e) {
+            parentsC.innerHTML = `<div class="alert alert-danger">Ошибка загрузки данных</div>`;
+        }
+    }
+
+    async function loadChildrenForRelation(rel, parentId) {
+        const childrenC = document.getElementById("childrenContainer");
+        childrenC.innerHTML = "<div class='p-2 text-muted'>Загрузка...</div>";
+        try {
+            const resp = await axios.get(
+                `${COREBASEURL}/tables/${rel.childTable}/by-fk`,
+                {params: {column: rel.childFk, value: parentId } }
+            );
+            renderTableInto(childrenC, resp.data);
+        } catch (e) {
+            childrenC.innerHTML = `<div class="alert alert-danger">Ошибка загрузки дочерних записей</div>`;
+        }
+    }
+
+    /* Отчёты */
+
+    function showReportsView() {
+        const content = document.getElementById("contentArea");
+        content.innerHTML = `
+            <div class="row mb-3">
+                <div class="col-12"><h5>Отчёты</h5></div>
+            </div>
+            <div class="row mb-3">
+                <div class="col-md-4">
+                    <label class="form-label">Тип отчёта</label>
+                    <select id="reportSelect" class="form-select">
+                        <option value="sales-monthly">Продажи по месяцам</option>
+                        <option value="top-clients">Топ клиентов</option>
+                        <option value="sold-cars">Проданные машины</option>
+                        <option value="profit">Прибыль</option>
+                        <option value="employees">Сотрудники</option>
+                        <option value="services-sales">Услуги по продажам</option>
+                    </select>
+                </div>
+            </div>
+            <div class="row mb-3" id="reportFiltersRow"></div>
+            <div class="row mb-3">
+                <div class="col-md-3">
+                    <button class="btn btn-primary w-100" onclick="searchReport()">Сформировать</button>
+                </div>
+            </div>
+            <div class="row">
+                <div class="col-12 table-wrap border bg-white">
+                    <div id="reportContainer" class="p-2"></div>
+                </div>
+            </div>
+        `;
+
+        const select = document.getElementById("reportSelect");
+        select.addEventListener("change", renderReportFilters);
+        renderReportFilters();
+    }
+
+    function renderReportFilters() {
+        const key = document.getElementById("reportSelect").value;
+        const row = document.getElementById("reportFiltersRow");
+        row.innerHTML = "";
+        if (key === "sales-monthly") {
+            row.innerHTML = `
+                <div class="col-md-3">
+                    <label class="form-label">Год</label>
+                    <input type="number" id="reportYear" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Месяц</label>
+                    <input type="number" id="reportMonth" class="form-control" min="1" max="12">
+                </div>
+            `;
+        } else if (key === "top-clients") {
+            row.innerHTML = `
+                <div class="col-md-3">
+                    <label class="form-label">Лимит</label>
+                    <input type="number" id="reportLimit" class="form-control" min="1">
+                </div>
+            `;
+        } else if (key === "sold-cars" || key === "profit") {
+            row.innerHTML = `
+                <div class="col-md-3">
+                    <label class="form-label">С</label>
+                    <input type="date" id="reportFrom" class="form-control">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">По</label>
+                    <input type="date" id="reportTo" class="form-control">
+                </div>
+            `;
+        } else {
+            // employees / services-sales — без своих фильтров, только поиск по столбцам в таблице
+            row.innerHTML = "";
+        }
+    }
+
+    async function searchReport() {
+        const reportKey = document.getElementById("reportSelect").value;
+        const container = document.getElementById("reportContainer");
+        container.innerHTML = "<div class='p-2 text-muted'>Загрузка...</div>";
+
+        const params = { };
+        if (reportKey === "sales-monthly") {
+            const yearVal = document.getElementById("reportYear")?.value ?? null;
+            const monthVal = document.getElementById("reportMonth")?.value ?? null;
+            if (yearVal) params.year = parseInt(yearVal, 10);
+            if (monthVal) params.month = parseInt(monthVal, 10);
+        } else if (reportKey === "sold-cars" || reportKey === "profit") {
+            const from = document.getElementById("reportFrom")?.value ?? null;
+            const to = document.getElementById("reportTo")?.value ?? null;
+            if (from && to) {
+                params.from = from;
+                params.to = to;
+            }
+        } else if (reportKey === "top-clients") {
+            const limitVal = document.getElementById("reportLimit")?.value ?? null;
+            if (limitVal) params.limit = parseInt(limitVal, 10);
+        }
+
+        try {
+            const resp = await axios.get(`${COREBASEURL}/reports/${reportKey}`, {params});
+            renderTableInto(container, resp.data);
+        } catch (e) {
+            container.innerHTML = `<div class="alert alert-danger">Ошибка формирования отчёта</div>`;
+        }
+    }
+
+    function logout() {
+        window.location.href = "/logout";
+    }
+
+    initApp();
+</script>
+</body>
+</html>
